@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"github.com/coreos/go-systemd/journal"
+	"github.com/docker/docker/opts"
+	flag "github.com/docker/docker/pkg/mflag"
 	"io"
 	"io/ioutil"
 	"log"
@@ -14,9 +17,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/docker/docker/opts"
-	flag "github.com/docker/docker/pkg/mflag"
 
 	dockerClient "github.com/fsouza/go-dockerclient"
 )
@@ -471,16 +471,52 @@ func pipeLogs(c *Context) error {
 		return err
 	}
 
+	//
+	// create some pipes to suck in stdout/stderr from
+	// the docker container
+	//
+	stdout_r, stdout_w := io.Pipe()
+	stderr_r, stderr_w := io.Pipe()
+
+	//
+	// spawn off some threads to read stderr/out and
+	// send them to the journal
+	//
+	go sendToJournal(stdout_r, journal.PriInfo)
+	go sendToJournal(stderr_r, journal.PriErr)
+
+	//
+	// map the stdout/err from the docker container to
+	// our pipes that we created above
+	//
 	err = client.Logs(dockerClient.LogsOptions{
 		Container:    c.Id,
 		Follow:       true,
 		Stdout:       true,
 		Stderr:       true,
-		OutputStream: os.Stdout,
-		ErrorStream:  os.Stderr,
+		OutputStream: stdout_w,
+		ErrorStream:  stderr_w,
 	})
 
 	return err
+}
+
+//
+// sends messages to the systemd journal
+//
+func sendToJournal(r io.Reader, priority journal.Priority) {
+	scanner := bufio.NewScanner(r)
+	//
+	// just keep reading the input and spewing it to
+	// the journal
+	//
+	for scanner.Scan() {
+		journalFields := make(map[string]string)
+		journal.Send(scanner.Text(), priority, journalFields)
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "It's broken: ", err)
+	}
 }
 
 func keepAlive(c *Context) error {
